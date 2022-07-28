@@ -137,7 +137,7 @@ class NoiseCov:
 
 
 class TotalCov:
-    def __init__(self, nside=16, lmax=200, nlev=1, fwhm=9.16*60, nl=None, regularizer=0.2):
+    def __init__(self, nside=16, lmax=200, nlev=1, fwhm_s=0, fwhm=9.16*60, nl=None, regularizer=0.2):
         """Total covariance matrix with both signal and noise covariance
 
         Parameters
@@ -154,8 +154,11 @@ class TotalCov:
         covmat with shape(2, 2, npix, npix)
 
         """
-        self.signal = SignalCov(lmax=lmax, nside=nside, fwhm=fwhm)
-        self.noise = NoiseCov(nlev=nlev, fwhm=fwhm, lmax=lmax, nside=nside, nl=nl, regularizer=regularizer)
+        # signal has an additional beam that's channel-dependent, while noise only has the smoothing beam
+        # applied during preprocessing. In practice fwhm_s is much smaller than fwhm (effect on 
+        # a few parts in 10^3.), so it's fine to assume fwhm_s is 0. 
+        self.signal = SignalCov(lmax=lmax, nside=nside, fwhm=(fwhm_s**2+fwhm**2)**0.5, nl=nl)
+        self.noise = NoiseCov(nlev=nlev, fwhm=fwhm_n, lmax=lmax, nside=nside, nl=nl, regularizer=regularizer)
 
     def calc(self, alpha, c):
         return self.signal.calc(alpha) + self.noise.calc(c)
