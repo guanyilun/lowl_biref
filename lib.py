@@ -2,10 +2,7 @@ import files
 from enlib.bunch import Bunch
 import healpy as hp, numpy as np
 import nawrapper as nw
-from pixell import utils as u
 
-from orphics import cosmology as cosmo
-from cosmoslib.utils import cwignerd
 
 def compute_spectra(imap1, imap2=None):
     """basic calculation of power spectrum based on healpy"""
@@ -52,6 +49,7 @@ def compute_spectra_namaster(imap1, imap2, lmin, lmax, lbin_widths=1,
     return cls
 
 def get_chan(chan):
+    """get channel data from a channel name"""
     chans, bcs, bws, brs, sens = files.load_bandpass()
     i = list(chans).index(chan)
     if i == -1: raise ValueError("Channel not found!")
@@ -164,109 +162,3 @@ def beam_match(imap, src, tgt):
     fwhm = (tgt**2 - src**2)**0.5
     omap = hp.smoothing(imap, fwhm=fwhm*u.arcmin)
     return omap
-
-class SignalCov:
-    def __init__(self, cl=None, lmax=200, nside=16):
-        """
-        Parameters
-        ----------
-        aps: dict with keys like "EE", "TT", etc.
-        lmax: maximum ell to sum
-        # alpha: rotation angle, if necessary because it induces QU covariance which is 0 with alpha=0
-
-        Returns
-        -------
-        covmat with shape(2, 2, npix x npix)
-
-        """
-        npix = hp.nside2npix(nside)
-        x,y,z = hp.pix2vec(nside, np.arange(npix))
-        # pairwise dot products
-        cos = np.outer(x,x) + np.outer(y,y) + np.outer(z,z)
-        # make sure cosine values are well behaved
-        cos = np.clip(cos, -1, 1)
-        flat_cos = np.ravel(cos)
-
-        self.ell = np.arange(lmax+1)
-        if cl is None:
-            ell = np.arange(lmax+1)
-            cl = cosmo.default_theory()
-            EE = cl.lCl('EE', ell)
-            BB = cl.lCl('BB', ell)
-            cl = {}
-            cl['EE'] = EE
-            cl['BB'] = EE
-        else:
-            EE = cl['EE']
-            BB = cl['BB']
-        A = cwignerd.wignerd_cf_from_cl( 2,2,1,len(flat_cos),lmax,flat_cos,(EE+BB)/2)
-        B = cwignerd.wignerd_cf_from_cl(-2,2,1,len(flat_cos),lmax,flat_cos,(EE-BB)/2)
-        A = A.reshape(cos.shape)
-        B = B.reshape(cos.shape)
-
-        # covariance assuming no rotation
-        self.cov = np.array([[A+B, 0*A],[0*A, A-B]])
-        self.A = A
-        self.B = B
-
-    def calc(self, alpha=0):
-        if alpha==0:  return self.cov
-        # assumption: change in B from rotation is small
-        B_unrot = self.B
-        off_diag = np.sin(4*alpha)*B_unrot
-        self.cov[0,1,...] = off_diag
-        self.cov[1,0,...] = off_diag
-        return self.cov
-
-class NoiseCov:
-    def __init__(self, nl=None, nlev=1, fwhm=0, lmax=200, alpha=0, nside=16):
-        """
-        Parameters
-        ----------
-        nlev: tt noise level in uK arcmin
-        fwhm: in arcmin
-        lmax: maximum ell to sum
-
-        Returns
-        -------
-        covmat with shape(2, 2, npix x npix)
-
-        """
-        npix = hp.nside2npix(nside)
-        x,y,z = hp.pix2vec(nside, np.arange(npix))
-        # pairwise dot products
-        cos = np.outer(x,x) + np.outer(y,y) + np.outer(z,z)
-        # make sure cosine values are well behaved
-        cos = np.clip(cos, -1, 1)
-        flat_cos = np.ravel(cos)
-        self.ell = np.arange(lmax+1)
-        if nl is None:
-            if fwhm > 0:  bl = hp.gauss_beam(np.deg2rad(fwhm/60), lmax)
-            else: bl = np.ones(lmax+1)
-            nl = nlev**2*2 * bl**2
-        A = cwignerd.wignerd_cf_from_cl( 2,2,1,len(flat_cos),lmax,flat_cos,nl)
-        B = cwignerd.wignerd_cf_from_cl(-2,2,1,len(flat_cos),lmax,flat_cos,nl)
-        A = A.reshape(cos.shape)
-        B = B.reshape(cos.shape)
-        # covariance assuming no rotation
-        self.cov = np.array([[A+B, 0*A],[0*A, A-B]])
-        self.A = A
-        self.B = B
-
-    def calc(self, alpha=0):
-        """alpha = [alpha_i, ...] where i are each component"""
-        return self.cov/(1-np.sum(alpha))**2
-
-def icov(covmat):
-    """input covariance matrix has shape, 2, 2, npix, npix"""
-    # block matrix inversion following https://en.wikipedia.org/wiki/Block_matrix
-    A = covmat[0,0]
-    B = covmat[0,1]
-    C = covmat[1,0]
-    D = covmat[1,1]
-
-    iA = np.linalg.inv(A)
-    iE = np.linalg.inv(D - C@iA@B)
-    icov = np.array([[iA + iA@B@iE@C@iA, -iA@B@iE],
-            [-iE@C@iA, iE]])
-    return icov
