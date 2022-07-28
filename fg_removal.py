@@ -61,7 +61,7 @@ class SignalCov:
         self.A = A
         self.B = B
 
-    def calc(self, alpha=0):
+    def calc(self, alpha=0, inplace=True):
         """Calculate signal covariance matrix (with off-diagonal)
 
         Parameters
@@ -74,12 +74,13 @@ class SignalCov:
 
         """
         if alpha==0:  return self.cov
-        # assumption: change in B from rotation is small
-        B_unrot = self.B
-        off_diag = np.sin(4*alpha)*B_unrot
-        self.cov[0,1,...] = off_diag
-        self.cov[1,0,...] = off_diag
-        return self.cov
+        if not inplace: cov = np.zeros_like(self.cov)
+        else: cov = self.cov
+        cov[0,0,...] = self.A + self.B*np.cos(4*alpha)
+        cov[1,1,...] = self.A - self.B*np.cos(4*alpha)
+        cov[0,1,...] = self.B*np.sin(4*alpha)
+        cov[1,0,...] = self.B*np.sin(4*alpha)
+        return cov
 
 
 class NoiseCov:
