@@ -48,7 +48,7 @@ def load_bandpass(rows=None):
         # convert to nskip and nrows
         r_skip = r_beg - 1
         nrows = r_end - r_beg + 1
-# load bandpass information
+        # load bandpass information
         name, band_c, band_w, beam_r, sens = np.genfromtxt("data/bandpass_toshiya.txt",
                                                            dtype=None, encoding=None, unpack=True,
                                                            skip_header=r_skip, max_rows=nrows)        
@@ -69,4 +69,4 @@ def read_map(odir, comp, chan, sid=None):
         oname = op.join(odir, f"{comp}_{chan}.fits")
     return hp.read_map(oname, field=(0,1,2), dtype=float)
 
-chans, _, _, _, _ = load_bandpass() 
+# chans, _, _, _, _ = load_bandpass() 

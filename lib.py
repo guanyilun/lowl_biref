@@ -1,5 +1,4 @@
 import files
-from enlib.bunch import Bunch
 import healpy as hp, numpy as np
 import nawrapper as nw
 
@@ -50,6 +49,7 @@ def compute_spectra_namaster(imap1, imap2, lmin, lmax, lbin_widths=1,
 
 def get_chan(chan):
     """get channel data from a channel name"""
+    from enlib.bunch import Bunch
     chans, bcs, bws, brs, sens = files.load_bandpass()
     i = list(chans).index(chan)
     if i == -1: raise ValueError("Channel not found!")
