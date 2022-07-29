@@ -57,10 +57,22 @@ def generate_cls(lmax, r=0):
         if sp in ['te', 'ee']:
             cls_rb[sp][sel] = cls_with_rb[sp][sel] - cls_no_rb[sp][sel]
     # FIXME: be more careful when substracting so that I don't get
-    # negative cl here as a simple solution, I will just replace the
-    # negative part with 0
-    cls_rb['ee'][cls_rb['ee'] < 0] = 0
-    cls_rb['te'][cls_rb['te'] < 0] = 0
+    # negative clee here. A simple solution is that we replace the
+    # negative part with 0. This is not a good solution because it
+    # means that the reio bump + primary (without reio bump) is no longer 
+    # the same as the primary cmb. 
+    # 
+    # cls_rb['ee'][cls_rb['ee'] < 0] = 0
+    # cls_rb['te'][cls_rb['te'] < 0] = 0
+
+    # A slightly better attempt: set the negative part of the reio bump
+    # to zero consistently for ee and te, and define this as reio bump
+    # to then recalculate cls_no_rb. 
+    sel_nonzero = cls_rb['ee'] > 0
+    cls_rb['ee'][~sel_nonzero] = 0
+    cls_rb['te'][~sel_nonzero] = 0
+    for sp in ['tt','ee','bb','te']:
+        cls_no_rb[sp] = cls_with_rb[sp] - cls_rb[sp]
 
     return {
         'with_rb': cls_with_rb,

@@ -1,14 +1,16 @@
+#%%
 import numpy as np
 import healpy as hp
-import pysm3.units as u
 from cosmoslib.utils import cwignerd
 from orphics import cosmology as cosmo
-from pixell import utils as u
+from gen_sims import generate_cls
+from sympy import diag
 
 NSIDE = 16
+arcmin = np.deg2rad(1/60)
 
 class SignalCov:
-    def __init__(self, lmax=200, nside=16, fwhm=0, cl=None):
+    def __init__(self, lmax=200, nside=16, fwhm=0, cl=None, Tcmb=2.72548*1e6):
         """
         Parameters
         ----------
@@ -24,18 +26,22 @@ class SignalCov:
         """
         # get cl if not given
         if cl is None:
+            print("Warning: no cl provided, using default theory in orphics.cosmology")
             ell = np.arange(lmax+1)
             cl = cosmo.default_theory()
-            EE = cl.lCl('EE', ell)
-            BB = cl.lCl('BB', ell)
+            EE = cl.lCl('ee', ell)
+            BB = cl.lCl('bb', ell)
         else:
+            if Tcmb != 1: print(f"Warning: assumed input cl is dimensionless, applying Tcmb^2={Tcmb}^2 to it")
+            lmax = len(cl['ee'])-1
             ell = np.arange(lmax+1)
-            EE = cl['EE']
-            BB = cl['BB']
+            EE = cl['ee']*Tcmb**2
+            BB = cl['bb']*Tcmb**2
 
         # apply beam if needed
         if fwhm > 0:
-            bl = hp.gauss_beam(fwhm=fwhm*u.arcmin, lmax=lmax)
+            print("Applying beam with fwhm={} arcmin".format(fwhm))
+            bl = hp.gauss_beam(fwhm=fwhm*arcmin, lmax=lmax)
             EE *= bl**2 
             BB *= bl**2 
 
@@ -51,13 +57,14 @@ class SignalCov:
 
         # A = \sum (2l+1)/4\pi*(EE+BB)/2 d_{ 22}^l(\mu)
         # B = \sum (2l+1)/4\pi*(EE-BB)/2 d_{-22}^l(\mu)
+        print("Computing covariance matrix elements...")
         A = cwignerd.wignerd_cf_from_cl( 2,2,1,len(flat_cos),lmax,flat_cos,(EE+BB)/2)
         B = cwignerd.wignerd_cf_from_cl(-2,2,1,len(flat_cos),lmax,flat_cos,(EE-BB)/2)
         A = A.reshape(cos.shape)  # npix x npix
         B = B.reshape(cos.shape)
 
         # covariance assuming no rotation; rotation is done later in .calc
-        self.cov = np.array([[A+B, 0*A],[0*A, A-B]])
+        self.cov = np.array([[A+B, 0*A],[0*A, A-B]])  # allocate some memory here to avoid reallocation if needed
         self.A = A
         self.B = B
 
@@ -99,29 +106,36 @@ class NoiseCov:
 
         """
         if nl is None:
-            if fwhm > 0:  bl = hp.gauss_beam(fwhm=fwhm*u.arcmin, lmax=lmax)
+            if fwhm > 0:  bl = hp.gauss_beam(fwhm=fwhm*arcmin, lmax=lmax)
             else: bl = np.ones(lmax+1)
-            nl = 2*(nlev*u.arcmin)**2*bl**2  # factor 2 from T to P
+            nl = 2*(nlev*arcmin)**2*bl**2  # factor 2 from T to P
 
         # compute cosine for gauss legendre quadrature
         npix = hp.nside2npix(nside)
-        # pairwise dot products
+        # pairwise dot products (n \cdot n')
         x,y,z = hp.pix2vec(nside, np.arange(npix))
         cos = np.outer(x,x) + np.outer(y,y) + np.outer(z,z)
         # make sure cosine values are well behaved
         cos = np.clip(cos, -1, 1)
         flat_cos = np.ravel(cos)
+
         # with smoothing, the covariance matrix is not diagonal anymore,
         # we calculate it similar to covariance matrix of the signal. Now
         # NlEE = NlBB -> A \neq 0, B=0.
+        print("Computing covariance matrix elements...")
         A = cwignerd.wignerd_cf_from_cl(2,2,1,len(flat_cos),lmax,flat_cos,nl)
         A = A.reshape(cos.shape)
-        self.cov = np.array([[A, 0*A],[0*A, A]])
-        # add a small regularizer to avoid singularity
-        if regularizer:
-            self.cov += np.diag(np.ones(npix)*(regularizer*u.arcmin)**2)  # TODO: check
 
-    def calc(self, c=[0]):
+        # add a small regularizer to avoid singularity
+        if regularizer>0:  # TODO: check this is correct
+            print(f"Add a regularizer with {regularizer} uK arcmin to the diagonal to avoid singularity")
+            # add to the diagonal only: (the fast way)
+            diag = np.einsum('ii->i', A)  # in-place memory slicing
+            diag += (regularizer*arcmin)**2
+        self.A = A
+        self.cov = np.array([[A, 0*A],[0*A, A]])
+
+    def calc(self, c=[0], inplace=True):
         """Calculate noise covariance
 
         Parameters
@@ -133,7 +147,11 @@ class NoiseCov:
         cov: noise covariance matrix (2, 2, npix, npix)
 
         """
-        return self.cov / (1-np.sum(c))**2
+        if inplace: cov = self.cov
+        else: cov = np.zeros_like(self.cov)
+        cov[0,0,...] = self.A/(1-c[0]-c[1])**2
+        cov[1,1,...] = cov[0,0,...]
+        return cov
 
 
 class TotalCov:
@@ -154,16 +172,60 @@ class TotalCov:
         covmat with shape(2, 2, npix, npix)
 
         """
-        # signal has an additional beam that's channel-dependent, while noise only has the smoothing beam
-        # applied during preprocessing. In practice fwhm_s is much smaller than fwhm (effect on 
+        # get power spectra
+        cls = generate_cls(lmax)
+        # get covariance for both reionization bump (low ell) and recombination (high ell)
+        # for beam see the note below
+        fwhm_signal = (fwhm_s**2 + fwhm**2)**0.5
+        print("Initializing signal covariance matrix for reionization bump...")
+        self.cov_rei = SignalCov(nside=nside, cl=cls['rb'],    fwhm=fwhm_signal)
+        print("Initializing signal covariance matrix for recombination...")
+        self.cov_rec = SignalCov(nside=nside, cl=cls['no_rb'], fwhm=fwhm_signal)
+        # note: signal has an additional beam that's channel-dependent, 
+        # while noise only has the smoothing beam applied during preprocessing. 
+        # In practice fwhm_s is much smaller than fwhm (effect on 
         # a few parts in 10^3.), so it's fine to assume fwhm_s is 0. 
-        self.signal = SignalCov(lmax=lmax, nside=nside, fwhm=(fwhm_s**2+fwhm**2)**0.5, nl=nl)
-        self.noise = NoiseCov(nlev=nlev, fwhm=fwhm_n, lmax=lmax, nside=nside, nl=nl, regularizer=regularizer)
+        print("Initializing noise covariance matrix...")
+        self.noise = NoiseCov(nside=nside, nlev=nlev, fwhm=fwhm, lmax=lmax, nl=nl, 
+                              regularizer=regularizer)
 
-    def calc(self, alpha, c):
-        return self.signal.calc(alpha) + self.noise.calc(c)
+        # allocate some memory here to avoid reallocation if needed
+        self.cov = np.zeros_like(self.cov_rei.cov)
 
-def icov(covmat):
+    def calc(self, thetas, c, inplace=True, small_angle=True):
+        """Calculate total covariance matrix
+        
+        Parameters
+        ----------
+        thetas: [theta_rei, theta_rec]
+        c: list of coefficients for each template
+        inplace: if True, return the covariance matrix inplace
+        small_angle: if True, use small angle approximation
+
+        Returns
+        -------
+        cov: total covariance matrix (2, 2, npix, npix)
+
+        """
+        theta_rei, theta_rec = thetas
+        if inplace: cov = self.cov
+        else: cov = np.zeros_like(self.cov)
+        # use small angle approximation if wanted
+        if small_angle:
+            diag = self.cov_rei.A + self.cov_rec.A
+            off_diag = 4*(self.cov_rei.B*theta_rei + self.cov_rec.B*theta_rec)
+            cov[0,0,...] = diag
+            cov[1,1,...] = diag
+            cov[0,1,...] = off_diag
+            cov[1,0,...] = off_diag
+        else:
+            raise NotImplementedError
+        # add noise covariance
+        cov += self.noise.calc(c)
+        return cov
+
+
+def inv_cov(covmat):
     """Invert covariance matrix
     
     Parameters
@@ -186,6 +248,21 @@ def icov(covmat):
     icov = np.array([[iA + iA@B@iE@C@iA, -iA@B@iE],
             [-iE@C@iA, iE]])
     return icov
+
+def det_cov(covmat):
+    """Calculate the determinant of covariance matrix which is a block matrix
+    
+    Parameters
+    ---------- 
+    covmat: covariance matrix with shape (2,2,npix,npix)
+    
+    Following https://en.wikipedia.org/wiki/Block_matrix
+    
+    """
+    A = covmat[0,0]
+    B = covmat[0,1]
+    # special case with A=D, B=C
+    return np.linalg.det(A-B)*np.linalg.det(A+B)
 
 def preprocess(imaps):
     omaps = []
@@ -235,3 +312,19 @@ def fg_removal(imaps, templates, covmats):
 
     """
     loglike = build_likelihood(imaps, templates, covmats)
+
+#%%
+noise = NoiseCov(nside=16, lmax=200, regularizer=0.2, fwhm=9.16*60)
+cov = noise.calc([0.1, 0.1])
+
+# %%
+import matplotlib.pyplot as plt
+plt.rcParams['figure.figsize'] = (8, 8)
+plt.rcParams['figure.dpi'] = 140
+
+plt.imshow(cov[0,0], cmap='gray')
+# %%
+np.diag(cov[0,0])
+
+# %%
+np.linalg.det(cov[0,0])
