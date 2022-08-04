@@ -1,4 +1,4 @@
-import os, os.path as op
+import os.path as op
 import healpy as hp
 import numpy as np
 from pixell import utils
@@ -18,7 +18,15 @@ def ps(tag, comp):
 
 def load_sim(tag, comp, chan=None, sid=None):
     """load simulation based on a tag, sid, and given channel. If chan
-    is None, it will load all channels."""
+    is None, it will load all channels.
+
+    Parameters
+    ----------
+    tag : str
+    comp : str, e.g., cmb, d0, s0
+    chan : channel name, str or list of str
+
+    """
     if chan is None:
         maps = {}
         chans, _, _, _, _ = load_bandpass()

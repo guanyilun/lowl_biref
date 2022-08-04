@@ -161,3 +161,15 @@ def beam_match(imap, src, tgt):
     fwhm = (tgt**2 - src**2)**0.5
     omap = hp.smoothing(imap, fwhm=fwhm*u.arcmin)
     return omap
+
+# utils
+import time
+class benchmark:
+    def __init__(self, name):
+        self.name = name
+        self.start = time.time()
+    def __enter__(self):
+        return self
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        print("%s: %.2f sec" % (self.name, time.time() - self.start))
+        return False

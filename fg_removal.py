@@ -5,6 +5,7 @@ import healpy as hp
 from scipy.optimize import minimize
 from orphics import cosmology as cosmo
 from cosmoslib.utils import cwignerd
+from pixell import utils
 
 import files, lib
 from gen_sims import generate_cls
@@ -291,11 +292,28 @@ def preprocess(imaps):
     return omaps
 
 # covmat = TotalCov(nside=NSIDE, nlev=nlevs[i], fwhm=fwhms[i])
-def build_likelihood(imaps, templates, covmats):
-    """Build likelihood function based on the given templates and covariance matrices. 
-    Assume two templates, but easily generalizable to more."""
+def fg_removal(imaps, templates, covmats, method="BFGS", **kwargs):
+    """Perform foreground removal based on the template fitting method,
+    given templates and covariance matrices. Note that this assumes that
+    we have two templates here, but easily generalizable to more.
+
+    Parameters
+    ----------
+    imaps: list of target maps
+    templates: list of templates
+    covmats: list of covariance matrices
+    method: fitting method, either "BFGS" or "L-BFGS-B"
+    kwargs: keyword arguments for the fitting method
+
+    Returns
+    -------
+
+    """
     t1, t2 = templates
-    def loglike(theta1, theta2, c1, c2):
+    def loglike(params):
+        # unpack parameters
+        theta1, theta2, c1, c2 = params
+        # calculate -2log(L)
         chi2 = 0
         for i in range(len(imaps)):
             imap = imaps[i]
@@ -311,35 +329,110 @@ def build_likelihood(imaps, templates, covmats):
             chi2 += np.einsum('ik, ijkl, jl', x, icov, x)
             # add determinant part
             chi2 += slogdet_cov(cov)[1]
-        return -0.5*chi2
-    return loglike
-
-def fg_removal(imaps, templates, covmats, **kwargs):
-    """Remove foregrounds in a series of maps. This assumes that input maps
-    and templates are preprocessed properly. The processing assumed here includes
-    a smoothing of 9.16 deg and downgrade to nside=16.
-    
-    Parameters
-    ----------
-    imaps: list CMB maps to be fg-cleaned, with shape (nfreq, {Q,U}, npix)
-    templates: list of template maps with shape (ntemplates, {Q,U}, npix)
-    covmats: list of covariance matrice objects
-    
-    Returns
-    -------
-    imaps: dict
-        maps with foregrounds removed
-
-    """
-    loglike = build_likelihood(imaps, templates, covmats)
-    res = minimize(loglike, **kwargs)
+        print(f"loglike: {-0.5*chi2:.3f}")
+        return 0.5*chi2  # -log(L), for minimization
+    res = minimize(loglike, [0, 0, 0, 0], method=method, **kwargs)
     return res
 
-#%%
-noise = NoiseCov(nside=16, lmax=200, regularizer=0.2, fwhm=9.16*60)
-cov = noise.calc([0.1, 0.1])
 
-# %%
+#%%
+class args:
+    odir = "out"
+    rot = None
+    mask = None
+    tag = "cmb_fg"
+    fg = None
+    sid = 1
+    nside = 512
+    rot = False
+    downgrade = 0
+    beam_match = False
+    add_noise = True
+    noise_seed = 0
+    oname = "template_fgr_cmb.npy"
+    nlev = None
+if not op.exists(args.odir): os.makedirs(args.odir)
+
+#%%
+# restrict to a few channels
+chans = ["LFT_3", "MFT_7", "HFT_14"]
+P_sens = [0, 2, 0]  # uK arcmin
+# channels to be treated as signal / template
+signal_chan_ids = [1]
+template_chan_ids = [0,2]
+
+#%%
+# define maps to load
+comps = ["cmb"]  # always use cmb
+# load foreground if needed
+if args.fg is None: fg = []
+else: fg = args.fg.split(",")
+comps += fg
+
+# load maps
+maps = {}
+with lib.benchmark("load maps"):
+    for comp in comps:
+        m = files.load_sim(args.tag, comp=comp, sid=args.sid, chan=chans)
+        for chan in m:
+            if chan not in maps:  # first occurance, key doesn't exist yet
+                maps[chan] = m[chan]
+            else:
+                maps[chan] += m[chan]
+# rotate if necessary
+if args.rot:
+    # load rotation angles specified in a file or as arguments
+    if op.exists(args.rot): betas = np.loadtxt(args.rot)
+    else: betas = [float(b) for b in args.rot.split(",")]
+    # betas have to match number of maps
+    if len(betas) != len(maps): raise ValueError("Number of rotation angles does not match number of maps")
+
+    # rotate each channel
+    with lib.benchmark("rotate maps"):
+        for chan, beta in zip(maps, betas):
+            print(f"Rotating maps in chan: {chan} by {beta:.3f} [deg]")
+            maps[chan] = lib.rotate_pol(maps[chan], np.deg2rad(beta))
+    
+#%%
+# add noise, if necessary
+if args.add_noise:
+    with lib.benchmark("add noise"):
+        # is noise level provided in arguments?
+        for ci, chan in enumerate(maps):
+            if P_sens[ci] <= 0: continue
+            np.random.seed(ci+args.noise_seed*100)
+            npix  = maps[chan].shape[-1]
+            nside = hp.npix2nside(npix)
+            P_rms = P_sens[ci] / hp.nside2resol(nside, arcmin=True)
+            T_rms = P_rms / np.sqrt(2)
+            tot_rms = np.array([T_rms, P_rms, P_rms]).reshape(3, 1)
+            maps[chan] += np.random.randn(3, npix) * tot_rms
+#%%
+# smooth maps to a common beam of 9.16 deg
+with lib.benchmark("smooth maps"):
+    for chan in maps:
+        with utils.nowarn():
+            maps[chan] = hp.smoothing(maps[chan], fwhm=np.deg2rad(9.16))
+
+# downgrade to nside 16
+with lib.benchmark("downgrade maps"):
+    for chan in maps:
+        maps[chan] = hp.ud_grade(maps[chan], nside_out=NSIDE)
+
+#%%
+# calculate covariance matrix
+with lib.benchmark("calculate covariance matrix"):
+    covmats = []
+    for i in signal_chan_ids:
+        covmats.append(TotalCov(nside=16, nlev=P_sens[i], fwhm=9.16*60, regularizer=0.2))
+
+#%%
+templates = [maps[chans[i]][1:] for i in template_chan_ids]  # QU only
+signals   = [maps[chans[i]][1:] for i in signal_chan_ids]  # QU only
+
+#%%
+res = fg_removal(signals, templates, covmats, tol=1e-3)
+
 import matplotlib.pyplot as plt
 plt.rcParams['figure.figsize'] = (8, 8)
 plt.rcParams['figure.dpi'] = 140
