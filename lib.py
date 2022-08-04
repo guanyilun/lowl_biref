@@ -49,13 +49,12 @@ def compute_spectra_namaster(imap1, imap2, lmin, lmax, lbin_widths=1,
 
 def get_chan(chan):
     """get channel data from a channel name"""
-    from enlib.bunch import Bunch
     chans, bcs, bws, brs, sens = files.load_bandpass()
     i = list(chans).index(chan)
     if i == -1: raise ValueError("Channel not found!")
     else:
-        return Bunch(chan=chans[i],bc=bcs[i],bw=bws[i],
-                     fwhm=brs[i],sens=sens[i])
+        return {"chan":chans[i],"bc": bcs[i],"bw": bws[i],
+                "fwhm":brs[i],"sens": sens[i]}
 def get_bl(chan, lmax=512):
     chdata = get_chan(chan)
     return hp.gauss_beam(np.deg2rad(chdata.fwhm/60), lmax)

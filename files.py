@@ -31,7 +31,7 @@ def load_sim(tag, comp, chan=None, sid=None):
     # for dust and synchrotron model, no need to apply sid
     if comp[0] in ['d','s']: sid=None
     oname = op.join(simdir, tag, get_fname(comp, chan, sid))
-    if not op.exists(oname): raise ValueError("sim not found")
+    if not op.exists(oname): raise ValueError(f"Sim {oname} not found")
     with utils.nowarn():
         imap = hp.read_map(oname, field=(0,1,2), dtype=float)
     return imap

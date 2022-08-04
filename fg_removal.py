@@ -1,16 +1,19 @@
 #%%
+import os, os.path as op, argparse
 import numpy as np
 import healpy as hp
-from cosmoslib.utils import cwignerd
+from scipy.optimize import minimize
 from orphics import cosmology as cosmo
+from cosmoslib.utils import cwignerd
+
+import files, lib
 from gen_sims import generate_cls
-from sympy import diag
 
 NSIDE = 16
 arcmin = np.deg2rad(1/60)
 
 class SignalCov:
-    def __init__(self, lmax=200, nside=16, fwhm=0, cl=None, Tcmb=2.72548*1e6):
+    def __init__(self, nside=16, lmax=None, fwhm=0, cl=None, Tcmb=2.72548*1e6):
         """
         Parameters
         ----------
@@ -24,6 +27,7 @@ class SignalCov:
         covmat with shape(2, 2, npix x npix)
 
         """
+        if lmax is None: lmax = 3*nside-1
         # get cl if not given
         if cl is None:
             print("Warning: no cl provided, using default theory in orphics.cosmology")
@@ -58,8 +62,8 @@ class SignalCov:
         # A = \sum (2l+1)/4\pi*(EE+BB)/2 d_{ 22}^l(\mu)
         # B = \sum (2l+1)/4\pi*(EE-BB)/2 d_{-22}^l(\mu)
         print("Computing covariance matrix elements...")
-        A = cwignerd.wignerd_cf_from_cl( 2,2,1,len(flat_cos),lmax,flat_cos,(EE+BB)/2)
-        B = cwignerd.wignerd_cf_from_cl(-2,2,1,len(flat_cos),lmax,flat_cos,(EE-BB)/2)
+        A = cwignerd.wignerd_cf_from_cl( 2,2,1,len(flat_cos),lmax,flat_cos,(2*ell+1)/(4*np.pi)*(EE+BB)/2)
+        B = cwignerd.wignerd_cf_from_cl(-2,2,1,len(flat_cos),lmax,flat_cos,(2*ell+1)/(4*np.pi)*(EE-BB)/2)
         A = A.reshape(cos.shape)  # npix x npix
         B = B.reshape(cos.shape)
 
@@ -91,7 +95,7 @@ class SignalCov:
 
 
 class NoiseCov:
-    def __init__(self, nlev=1, fwhm=0, lmax=200, nside=16, nl=None, regularizer=0.2):
+    def __init__(self, nlev=1, fwhm=0, nside=16, lmax=None, nl=None, regularizer=0.2):
         """Noise covariance matrix: (N_1 + N_2) / (1-c_1-c_2)^2
 
         Parameters
@@ -105,10 +109,13 @@ class NoiseCov:
 
 
         """
+        if lmax is None: lmax = 3*nside-1
         if nl is None:
             if fwhm > 0:  bl = hp.gauss_beam(fwhm=fwhm*arcmin, lmax=lmax)
             else: bl = np.ones(lmax+1)
             nl = 2*(nlev*arcmin)**2*bl**2  # factor 2 from T to P
+        else:
+            lmax = len(nl)-1
 
         # compute cosine for gauss legendre quadrature
         npix = hp.nside2npix(nside)
@@ -123,7 +130,8 @@ class NoiseCov:
         # we calculate it similar to covariance matrix of the signal. Now
         # NlEE = NlBB -> A \neq 0, B=0.
         print("Computing covariance matrix elements...")
-        A = cwignerd.wignerd_cf_from_cl(2,2,1,len(flat_cos),lmax,flat_cos,nl)
+        ell = np.arange(0, lmax+1)
+        A = cwignerd.wignerd_cf_from_cl(2,2,1,len(flat_cos),lmax,flat_cos,(2*ell+1)/(4*np.pi)*nl)
         A = A.reshape(cos.shape)
 
         # add a small regularizer to avoid singularity
@@ -131,11 +139,11 @@ class NoiseCov:
             print(f"Add a regularizer with {regularizer} uK arcmin to the diagonal to avoid singularity")
             # add to the diagonal only: (the fast way)
             diag = np.einsum('ii->i', A)  # in-place memory slicing
-            diag += (regularizer*arcmin)**2
+            diag += (regularizer*arcmin)**2  # in-place addition to the diagonal part of A
         self.A = A
         self.cov = np.array([[A, 0*A],[0*A, A]])
 
-    def calc(self, c=[0], inplace=True):
+    def calc(self, c=[0,0], inplace=True):
         """Calculate noise covariance
 
         Parameters
@@ -249,7 +257,7 @@ def inv_cov(covmat):
             [-iE@C@iA, iE]])
     return icov
 
-def det_cov(covmat):
+def slogdet_cov(covmat):
     """Calculate the determinant of covariance matrix which is a block matrix
     
     Parameters
@@ -258,11 +266,19 @@ def det_cov(covmat):
     
     Following https://en.wikipedia.org/wiki/Block_matrix
     
+    Returns
+    -------
+    sign: sign of the determinant
+    logdet: log of the determinant
+
     """
     A = covmat[0,0]
     B = covmat[0,1]
     # special case with A=D, B=C
-    return np.linalg.det(A-B)*np.linalg.det(A+B)
+    # return np.linalg.det(A-B)*np.linalg.det(A+B)
+    sign1, logdet1 = np.linalg.slogdet(A-B)
+    sign2, logdet2 = np.linalg.slogdet(A+B)
+    return sign1*sign2, logdet1+logdet2
 
 def preprocess(imaps):
     omaps = []
@@ -276,25 +292,29 @@ def preprocess(imaps):
 
 # covmat = TotalCov(nside=NSIDE, nlev=nlevs[i], fwhm=fwhms[i])
 def build_likelihood(imaps, templates, covmats):
-    def loglike(alpha, cs):
+    """Build likelihood function based on the given templates and covariance matrices. 
+    Assume two templates, but easily generalizable to more."""
+    t1, t2 = templates
+    def loglike(theta1, theta2, c1, c2):
         chi2 = 0
         for i in range(len(imaps)):
             imap = imaps[i]
             covmat = covmats[i]
-            c = cs[i]  # template coefficients
             # compute x; x has shape (2, npix)
-            x  = imap - np.sum(templates*c[:,None,None], axis=0)
-            x /= (1-np.sum(c))
+            x  = imap - t1*c1 - t2*c2
+            x /= (1-c1-c2)
             # convert to 1d array
-            cov = covmat.calc(alpha, c)
+            cov = covmat.calc([theta1, theta2], [c1, c2])
             # compute inverse; icov has shape (2, 2, npix, npix)
-            icov = icov(cov)
+            icov = inv_cov(cov)
             # compute chi-square: x' cov^-1 x
             chi2 += np.einsum('ik, ijkl, jl', x, icov, x)
+            # add determinant part
+            chi2 += slogdet_cov(cov)[1]
         return -0.5*chi2
     return loglike
 
-def fg_removal(imaps, templates, covmats):
+def fg_removal(imaps, templates, covmats, **kwargs):
     """Remove foregrounds in a series of maps. This assumes that input maps
     and templates are preprocessed properly. The processing assumed here includes
     a smoothing of 9.16 deg and downgrade to nside=16.
@@ -312,6 +332,8 @@ def fg_removal(imaps, templates, covmats):
 
     """
     loglike = build_likelihood(imaps, templates, covmats)
+    res = minimize(loglike, **kwargs)
+    return res
 
 #%%
 noise = NoiseCov(nside=16, lmax=200, regularizer=0.2, fwhm=9.16*60)
